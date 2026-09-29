@@ -61,67 +61,87 @@ let private takePut (queue: System.Collections.Generic.List<AvarPut>) : AvarPut 
     found
 
 // Mirror of purescript-avar's drainVar: every state transition happens under
-// the gate, the callbacks themselves run outside of it.
+// the gate, the callbacks themselves run outside of it. The JavaScript
+// implementation relies on the single-threaded event loop to never preempt a
+// drain; native fibers run on several threads, so the drain must re-check for
+// work under the gate before releasing it.
+let private hasPendingWork (state: AvarState) : bool =
+    if not (isNull state.Error) then
+        state.Puts.Count > 0 || state.Takes.Count > 0 || state.Reads.Count > 0
+    elif state.HasValue then
+        state.Takes.Count > 0 || state.Reads.Count > 0
+    else
+        state.Puts.Count > 0
+
 let private drainVar (util: obj) (state: AvarState) =
-    let mutable alreadyDraining = false
-    lock state.Gate (fun () ->
-        if state.Draining then alreadyDraining <- true
-        else state.Draining <- true)
-    if not alreadyDraining then
-        try
-            let mutable go = true
-            while go do
-                let pending = System.Collections.Generic.List<unit -> unit>()
-                lock state.Gate (fun () ->
-                    if not (isNull state.Error) then
-                        let failure = utilCall util "left" state.Error
-                        while state.Puts.Count > 0 do
-                            match takePut state.Puts with
-                            | Some entry -> let callback = entry.Callback in pending.Add(fun () -> runEffect (sharpurs_apply callback failure))
-                            | None -> ()
-                        while state.Takes.Count > 0 do
-                            match takeEntry state.Takes with
-                            | Some entry -> let callback = entry.Callback in pending.Add(fun () -> runEffect (sharpurs_apply callback failure))
-                            | None -> ()
-                        while state.Reads.Count > 0 do
-                            match takeEntry state.Reads with
-                            | Some entry -> let callback = entry.Callback in pending.Add(fun () -> runEffect (sharpurs_apply callback failure))
-                            | None -> ()
-                    else
-                        let mutable put = None
-                        if not state.HasValue then
-                            put <- takePut state.Puts
+    let mutable work = true
+    while work do
+        let mutable claimed = false
+        lock state.Gate (fun () ->
+            if not state.Draining then
+                state.Draining <- true
+                claimed <- true)
+        if not claimed then
+            work <- false
+        else
+            try
+                let mutable go = true
+                while go do
+                    let pending = System.Collections.Generic.List<unit -> unit>()
+                    lock state.Gate (fun () ->
+                        if not (isNull state.Error) then
+                            let failure = utilCall util "left" state.Error
+                            while state.Puts.Count > 0 do
+                                match takePut state.Puts with
+                                | Some entry -> let callback = entry.Callback in pending.Add(fun () -> runEffect (sharpurs_apply callback failure))
+                                | None -> ()
+                            while state.Takes.Count > 0 do
+                                match takeEntry state.Takes with
+                                | Some entry -> let callback = entry.Callback in pending.Add(fun () -> runEffect (sharpurs_apply callback failure))
+                                | None -> ()
+                            while state.Reads.Count > 0 do
+                                match takeEntry state.Reads with
+                                | Some entry -> let callback = entry.Callback in pending.Add(fun () -> runEffect (sharpurs_apply callback failure))
+                                | None -> ()
+                        else
+                            let mutable put = None
+                            if not state.HasValue then
+                                put <- takePut state.Puts
+                                match put with
+                                | Some entry ->
+                                    state.Value <- entry.Value
+                                    state.HasValue <- true
+                                | None -> ()
+                            if state.HasValue then
+                                let readsBefore = state.Reads.Count
+                                let take = takeEntry state.Takes
+                                let success = utilCall util "right" state.Value
+                                for _ in 1 .. readsBefore do
+                                    match takeEntry state.Reads with
+                                    | Some entry -> let callback = entry.Callback in pending.Add(fun () -> runEffect (sharpurs_apply callback success))
+                                    | None -> ()
+                                match take with
+                                | Some entry ->
+                                    let callback = entry.Callback
+                                    state.Value <- null
+                                    state.HasValue <- false
+                                    pending.Add(fun () -> runEffect (sharpurs_apply callback success))
+                                | None -> ()
                             match put with
                             | Some entry ->
-                                state.Value <- entry.Value
-                                state.HasValue <- true
-                            | None -> ()
-                        if state.HasValue then
-                            let readsBefore = state.Reads.Count
-                            let take = takeEntry state.Takes
-                            let success = utilCall util "right" state.Value
-                            for _ in 1 .. readsBefore do
-                                match takeEntry state.Reads with
-                                | Some entry -> let callback = entry.Callback in pending.Add(fun () -> runEffect (sharpurs_apply callback success))
-                                | None -> ()
-                            match take with
-                            | Some entry ->
                                 let callback = entry.Callback
-                                state.Value <- null
-                                state.HasValue <- false
-                                pending.Add(fun () -> runEffect (sharpurs_apply callback success))
-                            | None -> ()
-                        match put with
-                        | Some entry ->
-                            let callback = entry.Callback
-                            let unitValue = utilCall util "right" null
-                            pending.Add(fun () -> runEffect (sharpurs_apply callback unitValue))
-                        | None -> ())
-                for action in pending do action ()
+                                let unitValue = utilCall util "right" null
+                                pending.Add(fun () -> runEffect (sharpurs_apply callback unitValue))
+                            | None -> ())
+                    for action in pending do action ()
+                    lock state.Gate (fun () ->
+                        if (not state.HasValue && state.Puts.Count = 0)
+                           || (state.HasValue && state.Takes.Count = 0 && state.Reads.Count = 0) then
+                            go <- false)
+            finally
                 lock state.Gate (fun () ->
-                    if (not state.HasValue && state.Puts.Count = 0) || (state.HasValue && state.Takes.Count = 0) then go <- false)
-        finally
-            lock state.Gate (fun () -> state.Draining <- false)
+                    state.Draining <- false
+                    work <- hasPendingWork state)
 
 let empty = box (fun (_: obj) -> box (newAvarState null false))
 
